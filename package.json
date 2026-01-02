@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "ts-node src/index.ts"
+    "start": "node dist/index.ts",
+    "build": "tsc"
   },
   "keywords": [],
   "author": "",

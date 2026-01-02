@@ -1,36 +1,44 @@
 import "dotenv/config";
-import { autoRetry } from "@grammyjs/auto-retry";
-import { run, sequentialize } from "@grammyjs/runner";
-import { apiThrottler } from "@grammyjs/transformer-throttler";
-import fetch from "node-fetch";
 import express from "express";
-import { Bot, Context, webhookCallback } from "grammy";
-import { File } from "./models/file.model";
-import { connectDB } from "./db";
+import cors from "cors";
+import fetch from "node-fetch";
 import crypto from "crypto";
 import NodeCache from "node-cache";
-import cors from "cors";
+import { Bot, Context, webhookCallback } from "grammy";
+import { autoRetry } from "@grammyjs/auto-retry";
+import { apiThrottler } from "@grammyjs/transformer-throttler";
+import { sequentialize } from "@grammyjs/runner";
 import { CronJob } from "cron";
 
+import { File } from "./models/file.model.js";
+import { connectDB } from "./db/index.js";
+
+/* ---------------- App Setup ---------------- */
+
 const app = express();
-app.use(cors())
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const cache = new Map<string, string>();
+const PORT = process.env.PORT || 8000;
+
+/* ---------------- Bot Setup ---------------- */
 
 const bot = new Bot<Context>(process.env.BOT_TOKEN!);
 bot.api.config.use(apiThrottler());
 bot.api.config.use(autoRetry());
-bot.use(sequentialize(ctx => String(ctx.from!.id)));
+bot.use(sequentialize(ctx => String(ctx.from?.id)));
 
-/* ---------- Helpers ---------- */
+/* ---------------- Caches ---------------- */
+
+const fileIdCache = new Map<string, string>();
 
 const filesCache = new NodeCache({
-    stdTTL: 60 * 5,      // cache for 60 seconds
+    stdTTL: 60 * 5, // 5 minutes
     checkperiod: 120,
 });
 
+/* ---------------- Helpers ---------------- */
 
 function UUID(): string {
     return crypto.randomUUID();
@@ -42,19 +50,15 @@ function generateThumbnailPath(): string {
 
 async function downloadTelegramFile(file_id: string): Promise<Buffer> {
     const file = await bot.api.getFile(file_id);
-    const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
+    const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
 
-    const res = await fetch(fileUrl);
-    if (!res.ok) {
-        throw new Error("Failed to download Telegram file");
-    }
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Failed to download Telegram file");
 
     return Buffer.from(await res.arrayBuffer());
 }
 
 async function uploadToGitHub(buffer: Buffer, path: string): Promise<string> {
-    const content = buffer.toString("base64");
-
     const res = await fetch(
         `https://api.github.com/repos/${process.env.GITHUB_USERNAME}/${process.env.GITHUB_REPO}/contents/${path}`,
         {
@@ -66,20 +70,18 @@ async function uploadToGitHub(buffer: Buffer, path: string): Promise<string> {
             },
             body: JSON.stringify({
                 message: `Upload thumbnail ${path}`,
-                content,
+                content: buffer.toString("base64"),
                 branch: process.env.GITHUB_BRANCH || "main",
             }),
         }
     );
 
-    if (!res.ok) {
-        throw new Error("Failed to upload thumbnail to GitHub");
-    }
+    if (!res.ok) throw new Error("GitHub upload failed");
 
     return `https://raw.githubusercontent.com/${process.env.GITHUB_USERNAME}/${process.env.GITHUB_REPO}/${process.env.GITHUB_BRANCH || "main"}/${path}`;
 }
 
-/* ---------- Commands ---------- */
+/* ---------------- Bot Commands ---------------- */
 
 bot.command("start", async (ctx) => {
     try {
@@ -89,8 +91,7 @@ bot.command("start", async (ctx) => {
         if (!payload) {
             await ctx.reply(
                 `👋 <b>Welcome to Video Downloader</b>\n\n` +
-                `Visit 👉 <a href="https://my-web.com">Video Downloader</a>\n\n` +
-                `You’ll be redirected back here automatically.`,
+                `Visit 👉 <a href="https://my-web.com">Video Downloader</a>`,
                 { parse_mode: "HTML" }
             );
             return;
@@ -98,37 +99,32 @@ bot.command("start", async (ctx) => {
 
         const id = payload.trim().replace(/^video_/, "");
         if (!id) {
-            await ctx.reply("❌ Invalid or corrupted video link.");
+            await ctx.reply("❌ Invalid video link.");
             return;
         }
 
-        let file_id = cache.get(id);
+        let file_id = fileIdCache.get(id);
 
         if (!file_id) {
             const file = await File.findById(id).lean();
             if (!file) {
-                await ctx.reply(
-                    "⚠️ This video is no longer available.\n\nIt may have been removed or expired."
-                );
+                await ctx.reply("⚠️ Video not available.");
                 return;
             }
-
             file_id = file.file_id;
-            cache.set(id, file_id);
+            fileIdCache.set(id, file_id);
         }
 
         await ctx.reply("🎬 <b>Your video is ready!</b>", { parse_mode: "HTML" });
         await bot.api.sendVideo(telegramId!, file_id);
 
-    } catch (error) {
-        console.error(error);
-        await ctx.reply(
-            "🚫 Something went wrong while processing your request.\nPlease try again later."
-        );
+    } catch (err) {
+        console.error(err);
+        await ctx.reply("🚫 Something went wrong. Try again later.");
     }
 });
 
-/* ---------- Admin Upload ---------- */
+/* ---------------- Admin Upload ---------------- */
 
 bot.on(":video", async (ctx) => {
     try {
@@ -141,8 +137,8 @@ bot.on(":video", async (ctx) => {
         const video = ctx.message?.video;
         if (!video) return;
 
-        const file_id = video.file_id;
         const title = ctx.message?.caption?.trim() || "Untitled Video";
+        const file_id = video.file_id;
 
         const thumbnail =
             video.thumbnail ??
@@ -156,49 +152,44 @@ bot.on(":video", async (ctx) => {
         }
 
         const file = await File.create({
-            file_id,
             title,
+            file_id,
             thumbnail: thumbnail_url,
         });
 
+        filesCache.flushAll(); // invalidate pagination cache
+
         await ctx.reply(
-            `✅ <b>Video uploaded successfully</b>\n\n` +
+            `✅ <b>Uploaded Successfully</b>\n\n` +
             `📌 <b>Title:</b> ${title}\n` +
             `🆔 <b>ID:</b> <code>${file._id}</code>\n` +
-            `🖼️ <b>Thumbnail:</b> <a href="${thumbnail_url}">View</a>`,
+            `🖼️ <a href="${thumbnail_url}">View Thumbnail</a>`,
             { parse_mode: "HTML" }
         );
 
-    } catch (error) {
-        console.error(error);
-        await ctx.reply("🚫 Failed to save the video. Please try again.");
+    } catch (err) {
+        console.error(err);
+        await ctx.reply("🚫 Upload failed.");
     }
 });
 
-/* ---------- Server ---------- */
+/* ---------------- API Routes ---------------- */
 
 app.get("/", (_, res) => {
-    res.status(200).json({ message: "working" });
+    res.json({ status: "ok" });
 });
-
-app.post(`/${process.env.BOT_TOKEN}`, webhookCallback(bot, "express"));
-
 
 app.get("/api/files", async (req, res) => {
     try {
-        const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+        const page = Math.max(Number(req.query.page) || 1, 1);
         const limit = 30;
         const skip = (page - 1) * limit;
 
-        const cacheKey = `files_page_${page}`;
-
-        // Serve from cache if exists
+        const cacheKey = `files_${page}`;
         const cached = filesCache.get(cacheKey);
-        if (cached) {
-            return res.status(200).json(cached);
-        }
 
-        // DB query
+        if (cached) return res.json(cached);
+
         const [files, total] = await Promise.all([
             File.find({})
                 .sort({ createdAt: -1 })
@@ -217,34 +208,33 @@ app.get("/api/files", async (req, res) => {
             data: files,
         };
 
-        // Store in cache
         filesCache.set(cacheKey, response);
+        res.json(response);
 
-        res.status(200).json(response);
-
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to fetch files",
-        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false });
     }
 });
 
+/* ---------------- Webhook ---------------- */
 
-const PORT = process.env.PORT;
+app.post(`/${process.env.BOT_TOKEN}`, webhookCallback(bot, "express"));
 
-connectDB()
-    .then(() => {
-        app.listen(PORT, async () => {
-            await bot.init();
-            // run(bot);
-            await bot.api.setWebhook(`${process.env.RENDER_EXTERNAL_URL}/${process.env.BOT_TOKEN}`)
-            console.log(`Server running on http://localhost:${PORT}`);
-            new CronJob("*/12 * * * *", async () => { await fetch(process.env.RENDER_EXTERNAL_URL!); }, null, true)
-        });
+/* ---------------- Start Server ---------------- */
 
-    })
-    .catch(() => {
-        process.exit(1);
+connectDB().then(async () => {
+    app.listen(PORT, async () => {
+        await bot.init();
+        await bot.api.setWebhook(
+            `${process.env.RENDER_EXTERNAL_URL}/${process.env.BOT_TOKEN}`
+        );
+
+        console.log(`🚀 Server running on port ${PORT}`);
+
+        // keep-alive ping
+        new CronJob("*/10 * * * *", async () => {
+            await fetch(process.env.RENDER_EXTERNAL_URL!);
+        }, null, true);
     });
+}).catch(() => process.exit(1));
