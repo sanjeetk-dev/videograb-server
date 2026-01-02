@@ -10,6 +10,7 @@ import { connectDB } from "./db";
 import crypto from "crypto";
 import NodeCache from "node-cache";
 import cors from "cors";
+import { CronJob } from "cron";
 
 const app = express();
 app.use(cors())
@@ -231,7 +232,7 @@ app.get("/api/files", async (req, res) => {
 });
 
 
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT;
 
 connectDB()
     .then(() => {
@@ -240,7 +241,9 @@ connectDB()
             // run(bot);
             await bot.api.setWebhook(`${process.env.RENDER_EXTERNAL_URL}/${process.env.BOT_TOKEN}`)
             console.log(`Server running on http://localhost:${PORT}`);
+            new CronJob("*/12 * * * *", async () => { await fetch(process.env.RENDER_EXTERNAL_URL!); }, null, true)
         });
+
     })
     .catch(() => {
         process.exit(1);
